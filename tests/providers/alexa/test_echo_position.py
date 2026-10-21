@@ -1,7 +1,7 @@
 """Tests for correcting the Alexa player's position from the Echo's own reports."""
 
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import aiohttp
 import pytest
@@ -190,3 +190,78 @@ async def test_playback_state_failures_return_none(provider: MagicMock, session:
     """Missing endpoints, bad bodies and network errors are quiet None results."""
     provider.mass.http_session = session
     assert await get_playback_state(provider, "Echo Dot") is None
+
+
+@pytest.mark.parametrize("command", ["stop", "new stream"])
+async def test_report_fetched_before_a_playback_command_is_discarded(
+    player: AlexaPlayer, command: str
+) -> None:
+    """A stop or new stream while the request is out makes its report stale."""
+
+    async def slow_lookup(*_args: Any) -> dict[str, Any]:
+        player._playback_generation += 1  # what stop()/play_media() do first
+        if command == "stop":
+            player._attr_playback_state = PlaybackState.IDLE
+        return _report()
+
+    with patch.object(alexa, "get_playback_state", AsyncMock(side_effect=slow_lookup)):
+        await player.poll()
+    player.update_state.assert_not_called()  # type: ignore[attr-defined]
+    assert player._attr_elapsed_time == 0
+    expected = PlaybackState.IDLE if command == "stop" else PlaybackState.PLAYING
+    assert player.playback_state == expected
+
+
+@pytest.mark.parametrize("method", ["stop", "play", "pause", "play_media"])
+async def test_playback_commands_invalidate_reports_in_flight(
+    player: AlexaPlayer, provider: MagicMock, method: str
+) -> None:
+    """Every playback command bumps the generation that in-flight reports are checked against."""
+    provider.get_intent_utterance = AsyncMock(return_value="ask music assistant to stop")
+    provider.mass.streams.resolve_stream_url = AsyncMock(return_value="http://ma/flow/x.mp3")
+    provider.config.get_value.return_value = "en-US"
+    api = MagicMock(run_custom=AsyncMock())
+    with (
+        patch.object(AlexaPlayer, "api", new_callable=PropertyMock, return_value=api),
+        patch.object(alexa, "api_request", AsyncMock(return_value="{}")),
+    ):
+        before = player._playback_generation
+        if method == "play_media":
+            await player.play_media(MagicMock(title="Song", image_url=None))
+        else:
+            await getattr(player, method)()
+    assert player._playback_generation == before + 1
+
+
+async def test_pause_moves_the_queue_to_the_reported_offset_first(provider: MagicMock) -> None:
+    """MA's real update path re-bases the queue while the player still counts as playing."""
+    # Let the player's own position count: no audio-source session or other player to mirror.
+    provider.mass.players.get_audio_source_session.return_value = None
+    provider.mass.players.get_player.return_value = None
+    player = AlexaPlayer(provider, "Echo Dot", AlexaDevice())
+    player._attr_playback_state = PlaybackState.PLAYING
+    player._attr_elapsed_time = 0
+    player._attr_elapsed_time_last_updated = NOW - 600
+    jumps: list[tuple[PlaybackState, float | None]] = []
+    provider.mass.players.on_player_position_jumped.side_effect = lambda p: jumps.append(
+        (p.state.playback_state, p.state.corrected_elapsed_time)
+    )
+    with patch("music_assistant.models.player.time.time", return_value=NOW):
+        player.update_state()  # settle the initial state (clock estimate at 600 s)
+    jumps.clear()
+    with (
+        patch.object(
+            alexa,
+            "get_playback_state",
+            AsyncMock(return_value=_report(activity="STOPPED", offsetMs=90_500)),
+        ),
+        patch("music_assistant.providers.alexa.time.time", return_value=NOW),
+        patch("music_assistant.models.player.time.time", return_value=NOW),
+    ):
+        await player.poll()
+    assert jumps
+    state, elapsed = jumps[0]
+    assert state == PlaybackState.PLAYING
+    assert elapsed == pytest.approx(90.5)
+    assert player.playback_state == PlaybackState.PAUSED
+    assert player.state.corrected_elapsed_time == pytest.approx(90.5)

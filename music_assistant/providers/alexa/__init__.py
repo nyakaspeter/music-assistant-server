@@ -280,6 +280,8 @@ class AlexaPlayer(Player):
         self._last_stream_url: str | None = None
         self._attr_poll_interval = POLL_INTERVAL
         self._last_observed_at: float | None = None
+        # Bumped by every playback command, so a report fetched before it is discarded.
+        self._playback_generation = 0
 
     @property
     def needs_poll(self) -> bool:
@@ -296,7 +298,11 @@ class AlexaPlayer(Player):
         if self.playback_state == PlaybackState.IDLE:
             # Stopped by MA; the Echo has nothing newer to say about this queue.
             return
+        generation = self._playback_generation
         report = await get_playback_state(self.provider, self.player_id)
+        if generation != self._playback_generation:
+            # A playback command ran while the report was on its way; it describes the past.
+            return
         if not report or not report.get("current"):
             # No report (yet), or the Echo is still on an older stream.
             return
@@ -312,6 +318,14 @@ class AlexaPlayer(Player):
         ):
             return
         self._last_observed_at = observed_at
+        if state == PlaybackState.PAUSED:
+            # In flow mode the queue only follows a playing player's position (see
+            # _get_flow_queue_stream_index), so move it to the paused offset as playing
+            # first; otherwise it stays at the clock estimate until playback resumes.
+            self._attr_playback_state = PlaybackState.PLAYING
+            self._attr_elapsed_time = offset_ms / 1000
+            self._attr_elapsed_time_last_updated = time.time()
+            self.update_state()
         # The age keeps the anchor on MA's clock even if the skill API runs elsewhere.
         self._attr_elapsed_time = offset_ms / 1000
         self._attr_elapsed_time_last_updated = time.time() - age
@@ -331,6 +345,7 @@ class AlexaPlayer(Player):
 
     async def stop(self) -> None:
         """Handle STOP command on the player."""
+        self._playback_generation += 1
         provider = cast("AlexaProvider", self.provider)
 
         utter = await provider.get_intent_utterance("AMAZON.StopIntent", "stop")
@@ -342,6 +357,7 @@ class AlexaPlayer(Player):
 
     async def play(self) -> None:
         """Handle PLAY command on the player."""
+        self._playback_generation += 1
         provider = cast("AlexaProvider", self.provider)
 
         utter = await provider.get_intent_utterance("AMAZON.ResumeIntent", "resume")
@@ -352,6 +368,7 @@ class AlexaPlayer(Player):
 
     async def pause(self) -> None:
         """Handle PAUSE command on the player."""
+        self._playback_generation += 1
         provider = cast("AlexaProvider", self.provider)
 
         utter = await provider.get_intent_utterance("AMAZON.PauseIntent", "pause")
@@ -368,6 +385,7 @@ class AlexaPlayer(Player):
 
     async def play_media(self, media: PlayerMedia) -> None:
         """Handle PLAY MEDIA on the player."""
+        self._playback_generation += 1
         stream_url = await self.provider.mass.streams.resolve_stream_url(self.player_id, media)
 
         payload = {
