@@ -1,7 +1,8 @@
 """Tests for correcting the Alexa player's position from the Echo's own reports."""
 
+import asyncio
 import math
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import aiohttp
@@ -238,24 +239,43 @@ async def test_report_fetched_before_a_playback_command_is_discarded(
 
 
 @pytest.mark.parametrize("method", ["stop", "play", "pause", "play_media"])
-async def test_playback_commands_invalidate_reports_in_flight(
+async def test_report_requested_during_a_playback_command_is_discarded(
     player: AlexaPlayer, provider: MagicMock, method: str
 ) -> None:
-    """Every playback command bumps the generation that in-flight reports are checked against."""
+    """A lookup started while a command waits for Amazon and answered after it is stale."""
     provider.get_intent_utterance = AsyncMock(return_value="ask music assistant to stop")
     provider.mass.streams.resolve_stream_url = AsyncMock(return_value="http://ma/flow/x.mp3")
     provider.config.get_value.return_value = "en-US"
-    api = MagicMock(run_custom=AsyncMock())
+    answer = asyncio.Event()
+    lookups: list[asyncio.Task[None]] = []
+
+    async def slow_lookup(*_args: Any) -> dict[str, Any]:
+        await answer.wait()
+        return _report()
+
+    async def amazon(*_args: Any) -> None:
+        # The poll asks the skill API while the command is still waiting for Amazon.
+        lookups.append(asyncio.create_task(player.poll()))
+        await asyncio.sleep(0)
+
+    api = MagicMock(run_custom=AsyncMock(side_effect=amazon))
     with (
         patch.object(AlexaPlayer, "api", new_callable=PropertyMock, return_value=api),
         patch.object(alexa, "api_request", AsyncMock(return_value="{}")),
+        patch.object(alexa, "get_playback_state", AsyncMock(side_effect=slow_lookup)),
     ):
-        before = player._playback_generation
         if method == "play_media":
             await player.play_media(MagicMock(title="Song", image_url=None))
         else:
             await getattr(player, method)()
-    assert player._playback_generation == before + 1
+        state = player.playback_state
+        update_state = cast("MagicMock", player.update_state)
+        update_state.reset_mock()
+        answer.set()
+        await lookups[0]
+    update_state.assert_not_called()
+    assert player.playback_state == state
+    assert player._attr_elapsed_time == 0
 
 
 async def test_pause_moves_the_queue_to_the_reported_offset_first(provider: MagicMock) -> None:
