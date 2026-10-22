@@ -1,5 +1,6 @@
 """Tests for correcting the Alexa player's position from the Echo's own reports."""
 
+import math
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -34,6 +35,8 @@ def provider() -> MagicMock:
     provider.domain = "alexa"
     provider.manifest.domain = "alexa"
     provider.mass = MagicMock()
+    provider.mass.loop.time.return_value = 100.0
+    provider._playback_state_retry_at = -math.inf
     provider.get_setup_value = MagicMock(side_effect=_setup_value)
     config = MagicMock()
     config.name = None
@@ -190,6 +193,28 @@ async def test_playback_state_failures_return_none(provider: MagicMock, session:
     """Missing endpoints, bad bodies and network errors are quiet None results."""
     provider.mass.http_session = session
     assert await get_playback_state(provider, "Echo Dot") is None
+
+
+@pytest.mark.parametrize(
+    ("session", "backs_off"),
+    [
+        (_session(error=aiohttp.ClientConnectionError("down")), True),
+        (_session(error=TimeoutError()), True),
+        (_session(status=404), False),
+    ],
+)
+async def test_unreachable_skill_api_is_left_alone_for_a_while(
+    provider: MagicMock, session: MagicMock, backs_off: bool
+) -> None:
+    """MA polls players in turn, so a down API must not cost a timeout per Echo each round."""
+    provider.mass.http_session = session
+    await get_playback_state(provider, "Echo Dot")
+    provider.mass.loop.time.return_value = 100.0 + alexa.PLAYBACK_STATE_RETRY_DELAY - 1
+    await get_playback_state(provider, "Other Echo")
+    assert session.get.call_count == (1 if backs_off else 2)
+    provider.mass.loop.time.return_value = 100.0 + alexa.PLAYBACK_STATE_RETRY_DELAY
+    await get_playback_state(provider, "Echo Dot")
+    assert session.get.call_count == (2 if backs_off else 3)
 
 
 @pytest.mark.parametrize("command", ["stop", "new stream"])
