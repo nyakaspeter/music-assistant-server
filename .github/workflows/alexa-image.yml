@@ -7,7 +7,7 @@ on:
     branches:
       - stable
     paths:
-      - music_assistant/providers/alexa/**
+      - music_assistant/**
       - Dockerfile.alexa
       - .github/workflows/alexa-image.yml
   workflow_dispatch:

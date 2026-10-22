@@ -1,11 +1,11 @@
-# The official Music Assistant image with this fork's Alexa provider on top.
+# The official Music Assistant image with this fork's code on top.
 # Built by .github/workflows/alexa-image.yml; MA_VERSION is the release this branch is on.
 ARG MA_VERSION=2.10.7
 FROM ghcr.io/music-assistant/server:${MA_VERSION}
 
-COPY music_assistant/providers/alexa/ /tmp/alexa/
+COPY music_assistant/ /tmp/music_assistant/
 # Ask Python where the package lives instead of hard-coding the venv's Python version.
-RUN target="$(python -c 'import music_assistant, os; print(os.path.dirname(music_assistant.__file__))')/providers/alexa" \
-    && test -d "$target" \
-    && cp -r /tmp/alexa/. "$target"/ \
-    && rm -rf /tmp/alexa
+RUN target="$(python -c 'import music_assistant, os; print(os.path.dirname(music_assistant.__file__))')" \
+    && test -d "$target/providers/alexa" \
+    && cp -r /tmp/music_assistant/. "$target"/ \
+    && rm -rf /tmp/music_assistant
