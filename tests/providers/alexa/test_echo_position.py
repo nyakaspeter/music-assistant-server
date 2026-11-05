@@ -278,8 +278,8 @@ async def test_report_requested_during_a_playback_command_is_discarded(
     assert player._attr_elapsed_time == 0
 
 
-async def test_pause_moves_the_queue_to_the_reported_offset_first(provider: MagicMock) -> None:
-    """MA's real update path re-bases the queue while the player still counts as playing."""
+async def test_paused_report_moves_the_queue_without_a_playing_blip(provider: MagicMock) -> None:
+    """MA's real update path sees one paused jump to the Echo's offset, vouched for."""
     # Let the player's own position count: no audio-source session or other player to mirror.
     provider.mass.players.get_audio_source_session.return_value = None
     provider.mass.players.get_player.return_value = None
@@ -287,13 +287,18 @@ async def test_pause_moves_the_queue_to_the_reported_offset_first(provider: Magi
     player._attr_playback_state = PlaybackState.PLAYING
     player._attr_elapsed_time = 0
     player._attr_elapsed_time_last_updated = NOW - 600
-    jumps: list[tuple[PlaybackState, float | None]] = []
+    jumps: list[tuple[PlaybackState, float | None, bool]] = []
     provider.mass.players.on_player_position_jumped.side_effect = lambda p: jumps.append(
-        (p.state.playback_state, p.state.corrected_elapsed_time)
+        (p.state.playback_state, p.state.corrected_elapsed_time, p.paused_position_reliable)
+    )
+    published: list[PlaybackState] = []
+    provider.mass.players.signal_player_state_update.side_effect = lambda p, *_args, **_kwargs: (
+        published.append(p.state.playback_state)
     )
     with patch("music_assistant.models.player.time.time", return_value=NOW):
         player.update_state()  # settle the initial state (clock estimate at 600 s)
     jumps.clear()
+    published.clear()
     with (
         patch.object(
             alexa,
@@ -304,9 +309,40 @@ async def test_pause_moves_the_queue_to_the_reported_offset_first(provider: Magi
         patch("music_assistant.models.player.time.time", return_value=NOW),
     ):
         await player.poll()
-    assert jumps
-    state, elapsed = jumps[0]
-    assert state == PlaybackState.PLAYING
+    assert len(jumps) == 1
+    state, elapsed, vouched = jumps[0]
+    assert state == PlaybackState.PAUSED
     assert elapsed == pytest.approx(90.5)
+    assert vouched
+    assert PlaybackState.PLAYING not in published
     assert player.playback_state == PlaybackState.PAUSED
     assert player.state.corrected_elapsed_time == pytest.approx(90.5)
+
+
+async def test_playing_report_is_not_a_vouched_paused_position(player: AlexaPlayer) -> None:
+    """Only a paused offset from the Echo lets the queue follow a paused player."""
+    await _poll(player, _report(activity="STOPPED", offsetMs=90_500))
+    assert player.paused_position_reliable
+    await _poll(player, _report(activity="PLAYING", offsetMs=91_000, observedAt=43.0))
+    assert not player.paused_position_reliable
+
+
+@pytest.mark.parametrize("method", ["stop", "play", "pause", "play_media"])
+async def test_playback_commands_do_not_vouch_for_the_paused_position(
+    player: AlexaPlayer, provider: MagicMock, method: str
+) -> None:
+    """MA's own commands do not know where the Echo is, so they clear the flag."""
+    await _poll(player, _report(activity="STOPPED", offsetMs=90_500))
+    provider.get_intent_utterance = AsyncMock(return_value="ask music assistant to stop")
+    provider.mass.streams.resolve_stream_url = AsyncMock(return_value="http://ma/flow/x.mp3")
+    provider.config.get_value.return_value = "en-US"
+    api = MagicMock(run_custom=AsyncMock())
+    with (
+        patch.object(AlexaPlayer, "api", new_callable=PropertyMock, return_value=api),
+        patch.object(alexa, "api_request", AsyncMock(return_value="{}")),
+    ):
+        if method == "play_media":
+            await player.play_media(MagicMock(title="Song", image_url=None))
+        else:
+            await getattr(player, method)()
+    assert not player.paused_position_reliable

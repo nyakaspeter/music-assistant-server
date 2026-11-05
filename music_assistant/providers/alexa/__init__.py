@@ -327,18 +327,12 @@ class AlexaPlayer(Player):
         ):
             return
         self._last_observed_at = observed_at
-        if state == PlaybackState.PAUSED:
-            # In flow mode the queue only follows a playing player's position (see
-            # _get_flow_queue_stream_index), so move it to the paused offset as playing
-            # first; otherwise it stays at the clock estimate until playback resumes.
-            self._attr_playback_state = PlaybackState.PLAYING
-            self._attr_elapsed_time = offset_ms / 1000
-            self._attr_elapsed_time_last_updated = time.time()
-            self.update_state()
         # The age keeps the anchor on MA's clock even if the skill API runs elsewhere.
         self._attr_elapsed_time = offset_ms / 1000
         self._attr_elapsed_time_last_updated = time.time() - age
         self._attr_playback_state = state
+        # The Echo's paused offset is its real position, so the queue may follow it.
+        self._attr_paused_position_reliable = state == PlaybackState.PAUSED
         self.update_state()
 
     @property
@@ -362,6 +356,7 @@ class AlexaPlayer(Player):
 
         # Reports requested while the command was out describe the state before it.
         self._playback_generation += 1
+        self._attr_paused_position_reliable = False
         self._attr_current_media = None
         self._attr_playback_state = PlaybackState.IDLE
         self.update_state()
@@ -376,6 +371,7 @@ class AlexaPlayer(Player):
 
         # Reports requested while the command was out describe the state before it.
         self._playback_generation += 1
+        self._attr_paused_position_reliable = False
         self._attr_playback_state = PlaybackState.PLAYING
         self.update_state()
 
@@ -389,6 +385,7 @@ class AlexaPlayer(Player):
 
         # Reports requested while the command was out describe the state before it.
         self._playback_generation += 1
+        self._attr_paused_position_reliable = False
         self._attr_playback_state = PlaybackState.PAUSED
         self.update_state()
 
@@ -442,6 +439,7 @@ class AlexaPlayer(Player):
         await self.api.run_custom(ALEXA_LANGUAGE_COMMANDS[ask_command_key])
         # Reports requested while the command was out describe the state before it.
         self._playback_generation += 1
+        self._attr_paused_position_reliable = False
         self._last_observed_at = None
         self._attr_elapsed_time = 0
         self._attr_elapsed_time_last_updated = time.time()
